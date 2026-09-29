@@ -93,9 +93,9 @@ internal fun <T> PhaseEngine<NativeBackendPhaseContext>.linkKlibs(
     return linkKlibsOutput to additionalOutput
 }
 
-internal fun <C : NativeBackendPhaseContext> PhaseEngine<C>.runBackend(backendContext: NativeBackendContext, irModule: IrModuleFragment, performanceManager: PerformanceManager?) {
+internal fun <C : NativeBackendPhaseContext> PhaseEngine<C>.runBackend(backendContext: NativeBackendContext, irModule: IrModuleFragment, performanceManager: PerformanceManager?): BitcodeCompilationOutput? {
     val config = context.config
-    useContext(backendContext) { backendEngine ->
+    return useContext(backendContext) { backendEngine ->
         backendEngine.runModuleWisePhase(createModulePhases(::FunctionsWithoutBoundCheckGenerator).first(), listOf(irModule))
 
         fun createGenerationState(fragment: BackendJobFragment): NativeGenerationState {
@@ -201,7 +201,7 @@ internal fun <C : NativeBackendPhaseContext> PhaseEngine<C>.runBackend(backendCo
             return generationStates
         }
 
-        fun runAfterLowerings(fragment: BackendJobFragment, generationState: NativeGenerationState) {
+        fun runAfterLowerings(fragment: BackendJobFragment, generationState: NativeGenerationState): BitcodeCompilationOutput? {
             val tempFiles = createTempFiles(config, fragment.cacheDeserializationStrategy)
             val outputFiles = generationState.outputFiles
             if (context.config.produce.isHeaderCache) {
@@ -210,11 +210,11 @@ internal fun <C : NativeBackendPhaseContext> PhaseEngine<C>.runBackend(backendCo
                     Path(outputFiles.nativeBinaryFile).createFile()
                     generationStateEngine.runAndMeasurePhase(FinalizeCachePhase, outputFiles)
                 }
-                return
+                return null
             }
             try {
                 fragment.performanceManager?.notifyPhaseStarted(PhaseType.Backend)
-                backendEngine.useContext(generationState, copyState = true) { generationStateEngine ->
+                return backendEngine.useContext(generationState, copyState = true) { generationStateEngine ->
                     val bitcodeFile = tempFiles.createBitcodeFile(generationState.llvmModuleName)
                     val cExportFiles = if (config.produceCInterface) {
                         CExportFiles(
@@ -231,19 +231,20 @@ internal fun <C : NativeBackendPhaseContext> PhaseEngine<C>.runBackend(backendCo
                     val moduleCompilationOutput = ModuleCompilationOutput(bitcodeFile, dependenciesTrackingResult)
                     // External compilation consumes serialized bitcode, so LLVM state is no longer needed.
                     generationState.dispose()
-                    if (config.optimizationsEnabled && !config.produce.isCache) {
-                        System.gc()
-                    }
-                    generationStateEngine.compileAndLink(
-                            moduleCompilationOutput,
-                            outputFiles.mainFileName,
-                            outputFiles,
-                            tempFiles,
-                    )
+                    BitcodeCompilationOutput(moduleCompilationOutput, outputFiles, tempFiles)
                 }
-            } finally {
+            } catch (t: Throwable) {
                 tempFiles.dispose()
+                throw t
+            } finally {
                 fragment.performanceManager?.notifyPhaseFinished(PhaseType.Backend)
+            }
+        }
+
+        fun runAfterLoweringsAndLink(fragment: BackendJobFragment, generationState: NativeGenerationState) {
+            val bitcodeCompilationOutput = runAfterLowerings(fragment, generationState) ?: return
+            fragment.performanceManager.tryMeasurePhaseTime(PhaseType.Backend) {
+                backendEngine.newEngine(generationState) { it.linkBitcode(bitcodeCompilationOutput) }
             }
         }
 
@@ -253,14 +254,15 @@ internal fun <C : NativeBackendPhaseContext> PhaseEngine<C>.runBackend(backendCo
         }
 
         val threadsCount = context.config.threadsCount
-        if (threadsCount == 1) {
-            fragmentsList.zip(generationStates).forEach { [fragment, generationState] ->
-                runAfterLowerings(fragment, generationState)
+        val bitcodeCompilationOutput = when {
+            fragmentsList.size == 1 -> runAfterLowerings(fragmentsList.single(), generationStates.single())
+            threadsCount == 1 -> {
+                fragmentsList.zip(generationStates).forEach { [fragment, generationState] ->
+                    runAfterLoweringsAndLink(fragment, generationState)
+                }
+                null
             }
-        } else {
-            if (fragmentsList.size == 1) {
-                runAfterLowerings(fragmentsList.first(), generationStates.first())
-            } else {
+            else -> {
                 // We'd love to run entire pipeline in parallel, but it's difficult (mainly because of the lowerings,
                 // which need cross-file access all the time and it's not easy to overcome this). So, for now,
                 // we split the pipeline into two parts - everything before lowerings (including them)
@@ -273,7 +275,7 @@ internal fun <C : NativeBackendPhaseContext> PhaseEngine<C>.runBackend(backendCo
                             // Currently, it's not possible to initialize the correct thread on `PerformanceManager` creation
                             // because new threads are spawned here when `fragment` with its `PerformanceManager` is already initialized.
                             fragment.performanceManager?.initializeCurrentThread()
-                            runAfterLowerings(fragment, generationState)
+                            runAfterLoweringsAndLink(fragment, generationState)
                         } catch (t: Throwable) {
                             thrownFromThread.set(t)
                         }
@@ -283,6 +285,7 @@ internal fun <C : NativeBackendPhaseContext> PhaseEngine<C>.runBackend(backendCo
                 executor.shutdown()
                 executor.awaitTermination(1, TimeUnit.DAYS)
                 thrownFromThread.get()?.let { throw it }
+                null
             }
         }
 
@@ -291,6 +294,24 @@ internal fun <C : NativeBackendPhaseContext> PhaseEngine<C>.runBackend(backendCo
                 performanceManager.addOtherUnitStats(it.performanceManager?.unitStats)
             }
         }
+        bitcodeCompilationOutput
+    }
+}
+
+internal class BitcodeCompilationOutput(
+        val moduleCompilationOutput: ModuleCompilationOutput,
+        val outputFiles: OutputFiles,
+        val tempFiles: TempFiles,
+)
+
+internal fun <C : NativeBackendPhaseContext> PhaseEngine<C>.linkBitcode(output: BitcodeCompilationOutput) {
+    try {
+        if (context.config.optimizationsEnabled && !context.config.produce.isCache) {
+            System.gc()
+        }
+        compileAndLink(output.moduleCompilationOutput, output.outputFiles.mainFileName, output.outputFiles, output.tempFiles)
+    } finally {
+        output.tempFiles.dispose()
     }
 }
 
