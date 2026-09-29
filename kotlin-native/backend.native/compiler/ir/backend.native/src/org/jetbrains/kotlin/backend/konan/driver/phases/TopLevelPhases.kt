@@ -19,6 +19,7 @@ import org.jetbrains.kotlin.backend.common.phaser.createFilePhases
 import org.jetbrains.kotlin.backend.common.phaser.createModulePhases
 import org.jetbrains.kotlin.backend.common.serialization.kotlinLibrary
 import org.jetbrains.kotlin.backend.konan.*
+import org.jetbrains.kotlin.backend.konan.driver.BasicNativeBackendPhaseContext
 import org.jetbrains.kotlin.backend.konan.driver.PerformanceManagerContext
 import org.jetbrains.kotlin.backend.konan.driver.NativeBackendPhaseContext
 import org.jetbrains.kotlin.backend.konan.driver.utilities.CExportFiles
@@ -93,9 +94,13 @@ internal fun <T> PhaseEngine<NativeBackendPhaseContext>.linkKlibs(
     return linkKlibsOutput to additionalOutput
 }
 
-internal fun <C : NativeBackendPhaseContext> PhaseEngine<C>.runBackend(backendContext: NativeBackendContext, irModule: IrModuleFragment, performanceManager: PerformanceManager?) {
+internal fun <C : NativeBackendPhaseContext> PhaseEngine<C>.runBackend(
+        backendContext: NativeBackendContext,
+        irModule: IrModuleFragment,
+        performanceManager: PerformanceManager?,
+): DeferredObjectLink? {
     val config = context.config
-    useContext(backendContext) { backendEngine ->
+    return useContext(backendContext) { backendEngine ->
         backendEngine.runModuleWisePhase(createModulePhases(::FunctionsWithoutBoundCheckGenerator).first(), listOf(irModule))
 
         fun createGenerationState(fragment: BackendJobFragment): NativeGenerationState {
@@ -201,7 +206,11 @@ internal fun <C : NativeBackendPhaseContext> PhaseEngine<C>.runBackend(backendCo
             return generationStates
         }
 
-        fun runAfterLowerings(fragment: BackendJobFragment, generationState: NativeGenerationState) {
+        fun runAfterLowerings(
+                fragment: BackendJobFragment,
+                generationState: NativeGenerationState,
+                deferObjectLink: Boolean,
+        ): DeferredObjectLink? {
             val tempFiles = createTempFiles(config, fragment.cacheDeserializationStrategy)
             val outputFiles = generationState.outputFiles
             if (context.config.produce.isHeaderCache) {
@@ -210,11 +219,12 @@ internal fun <C : NativeBackendPhaseContext> PhaseEngine<C>.runBackend(backendCo
                     Path(outputFiles.nativeBinaryFile).createFile()
                     generationStateEngine.runAndMeasurePhase(FinalizeCachePhase, outputFiles)
                 }
-                return
+                return null
             }
+            var linkDeferred = false
             try {
                 fragment.performanceManager?.notifyPhaseStarted(PhaseType.Backend)
-                backendEngine.useContext(generationState, copyState = true) { generationStateEngine ->
+                return backendEngine.useContext(generationState, copyState = true) { generationStateEngine ->
                     val bitcodeFile = tempFiles.createBitcodeFile(generationState.llvmModuleName)
                     val cExportFiles = if (config.produceCInterface) {
                         CExportFiles(
@@ -231,19 +241,27 @@ internal fun <C : NativeBackendPhaseContext> PhaseEngine<C>.runBackend(backendCo
                     val moduleCompilationOutput = ModuleCompilationOutput(bitcodeFile, dependenciesTrackingResult)
                     // External compilation consumes serialized bitcode, so LLVM state is no longer needed.
                     generationState.dispose()
-                    if (config.optimizationsEnabled && !config.produce.isCache) {
-                        System.gc()
+                    if (deferObjectLink) {
+                        linkDeferred = true
+                        DeferredObjectLink(moduleCompilationOutput, outputFiles, tempFiles, fragment.performanceManager, performanceManager)
+                    } else {
+                        if (config.optimizationsEnabled && !config.produce.isCache) {
+                            System.gc()
+                        }
+                        generationStateEngine.compileAndLink(
+                                moduleCompilationOutput,
+                                outputFiles.mainFileName,
+                                outputFiles,
+                                tempFiles,
+                        )
+                        null
                     }
-                    generationStateEngine.compileAndLink(
-                            moduleCompilationOutput,
-                            outputFiles.mainFileName,
-                            outputFiles,
-                            tempFiles,
-                    )
                 }
             } finally {
-                tempFiles.dispose()
-                fragment.performanceManager?.notifyPhaseFinished(PhaseType.Backend)
+                if (!linkDeferred) {
+                    tempFiles.dispose()
+                    fragment.performanceManager?.notifyPhaseFinished(PhaseType.Backend)
+                }
             }
         }
 
@@ -252,14 +270,16 @@ internal fun <C : NativeBackendPhaseContext> PhaseEngine<C>.runBackend(backendCo
             fragmentsList.runAllLowerings()
         }
 
+        val deferObjectLink = fragmentsList.size == 1 && !config.produce.isCache
+        var deferredObjectLink: DeferredObjectLink? = null
         val threadsCount = context.config.threadsCount
         if (threadsCount == 1) {
             fragmentsList.zip(generationStates).forEach { [fragment, generationState] ->
-                runAfterLowerings(fragment, generationState)
+                deferredObjectLink = runAfterLowerings(fragment, generationState, deferObjectLink)
             }
         } else {
             if (fragmentsList.size == 1) {
-                runAfterLowerings(fragmentsList.first(), generationStates.first())
+                deferredObjectLink = runAfterLowerings(fragmentsList.first(), generationStates.first(), deferObjectLink)
             } else {
                 // We'd love to run entire pipeline in parallel, but it's difficult (mainly because of the lowerings,
                 // which need cross-file access all the time and it's not easy to overcome this). So, for now,
@@ -273,7 +293,7 @@ internal fun <C : NativeBackendPhaseContext> PhaseEngine<C>.runBackend(backendCo
                             // Currently, it's not possible to initialize the correct thread on `PerformanceManager` creation
                             // because new threads are spawned here when `fragment` with its `PerformanceManager` is already initialized.
                             fragment.performanceManager?.initializeCurrentThread()
-                            runAfterLowerings(fragment, generationState)
+                            runAfterLowerings(fragment, generationState, deferObjectLink = false)
                         } catch (t: Throwable) {
                             thrownFromThread.set(t)
                         }
@@ -286,12 +306,47 @@ internal fun <C : NativeBackendPhaseContext> PhaseEngine<C>.runBackend(backendCo
             }
         }
 
-        if (performanceManager != null) {
+        if (performanceManager != null && deferredObjectLink == null) {
             fragmentsList.forEach {
                 performanceManager.addOtherUnitStats(it.performanceManager?.unitStats)
             }
         }
+        deferredObjectLink
     }
+}
+
+internal class DeferredObjectLink(
+        val moduleCompilationOutput: ModuleCompilationOutput,
+        val outputFiles: OutputFiles,
+        val tempFiles: TempFiles,
+        val fragmentPerformanceManager: PerformanceManager?,
+        val mainPerformanceManager: PerformanceManager?,
+)
+
+private class ObjectLinkContext(
+        config: NativeSecondStageCompilationConfig,
+        override val performanceManager: PerformanceManager?,
+) : BasicNativeBackendPhaseContext(config)
+
+internal fun PhaseEngine<NativeBackendPhaseContext>.runDeferredObjectLink(link: DeferredObjectLink) {
+    val config = context.config
+    try {
+        if (config.optimizationsEnabled) {
+            System.gc()
+        }
+        useContext(ObjectLinkContext(config, link.fragmentPerformanceManager), copyState = true) { linkEngine ->
+            linkEngine.compileAndLink(
+                    link.moduleCompilationOutput,
+                    link.outputFiles.mainFileName,
+                    link.outputFiles,
+                    link.tempFiles,
+            )
+        }
+    } finally {
+        link.tempFiles.dispose()
+        link.fragmentPerformanceManager?.notifyPhaseFinished(PhaseType.Backend)
+    }
+    link.mainPerformanceManager?.addOtherUnitStats(link.fragmentPerformanceManager?.unitStats)
 }
 
 internal fun <C : NativeBackendPhaseContext> PhaseEngine<C>.runBitcodeBackend(
